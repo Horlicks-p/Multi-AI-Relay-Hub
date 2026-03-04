@@ -13,3 +13,13 @@ node_modules/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# MD
+Multi-AI-Relay-Hub.md
+OPEN-ISSUES.md
+
+# py
+relay_ready.py
+
+#deprecated
+run_claude_cli.js.deprecated
