@@ -1,0 +1,82 @@
+// run_claude_cli.js
+// Wrapper script for Claude Code CLI -- reads from stdin, calls `claude -p`, writes to stdout.
+// Used by relay_ready.py as the "claude" model subprocess.
+
+const { execFileSync } = require("child_process");
+const readline = require("readline");
+
+const SYSTEM_PROMPT = [
+  "You are participating in a multi-AI conference room.",
+  "Messages you receive are prefixed with [speaker_name] tags (e.g. [human], [claude], [codex], [gemini]).",
+  "Please respond with your professional opinion based on the content.",
+  "Do not be confused by the speaker tags -- they simply identify who said what.",
+  "When responding, do NOT prefix your own name. The relay system handles that automatically.",
+].join(" ");
+
+const rl = readline.createInterface({ input: process.stdin });
+
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+
+  let msg = trimmed;
+  let sender = "unknown";
+
+  try {
+    const msg_obj = JSON.parse(trimmed);
+    msg = msg_obj.payload || "";
+    sender = msg_obj.from || "unknown";
+  } catch (e) {
+    // 備援機制：如果不是 JSON，就當作純文字
+  }
+
+  if (!msg) return;
+
+  const full_msg = `[${sender}] ${msg}`;
+  
+  // Robustly parse timeout from environment
+  let envTimeout = 600000; // default 600s
+  if (process.env.RELAY_TIMEOUT_SEC) {
+    const parsed = parseInt(process.env.RELAY_TIMEOUT_SEC);
+    if (!isNaN(parsed)) {
+      envTimeout = parsed * 1000;
+    }
+  }
+
+  try {
+    const isWin = process.platform === "win32";
+    const cmdName = isWin ? "claude.cmd" : "claude";
+
+    const result = execFileSync(
+      cmdName,
+      [
+        "-p",
+        full_msg,
+        "--system-prompt",
+        SYSTEM_PROMPT,
+        "--output-format",
+        "text",
+        "--no-session-persistence",
+      ],
+      {
+        encoding: "utf-8",
+        timeout: envTimeout, // Use environment variable
+        maxBuffer: 10_000_000, // 10 MB
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"]
+      },
+    );
+
+    const output = result.trim();
+    if (output) {
+      process.stdout.write(output + "\n");
+      process.stdout.write("END_OF_RESPONSE\n");
+    }
+  } catch (err) {
+    process.stderr.write(`[claude wrapper error] ${err.message}\n`);
+  }
+});
+
+rl.on("close", () => {
+  process.exit(0);
+});
