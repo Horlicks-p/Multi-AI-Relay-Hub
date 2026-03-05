@@ -417,6 +417,149 @@ def _spinner(stop_event: threading.Event, msg: str):
     sys.stdout.write(f"\r{' ' * (len(msg) + 10)}\r")
     sys.stdout.flush()
 
+# ─── BBS-Style ASCII Art Banner ──────────────────────────────────────────────
+
+_BLOCK_LETTERS = {
+    'M': ["█▄ ▄█", "█ █ █", "█   █", "█   █", "█   █"],
+    'U': ["█   █", "█   █", "█   █", "█   █", " ███ "],
+    'L': ["█    ", "█    ", "█    ", "█    ", "█████"],
+    'T': ["█████", "  █  ", "  █  ", "  █  ", "  █  "],
+    'I': ["█████", "  █  ", "  █  ", "  █  ", "█████"],
+    'A': [" ███ ", "█   █", "█████", "█   █", "█   █"],
+    'R': ["████ ", "█   █", "████ ", "█  █ ", "█   █"],
+    'E': ["█████", "█    ", "████ ", "█    ", "█████"],
+    'Y': ["█   █", " █ █ ", "  █  ", "  █  ", "  █  "],
+    'H': ["█   █", "█   █", "█████", "█   █", "█   █"],
+    'B': ["████ ", "█   █", "████ ", "█   █", "████ "],
+    ' ': ["  ", "  ", "  ", "  ", "  "],
+}
+
+_GRAD_CYAN = [
+    "\033[38;5;51m", "\033[38;5;45m", "\033[38;5;39m",
+    "\033[38;5;33m", "\033[38;5;27m",
+]
+_GRAD_PINK = [
+    "\033[38;5;213m", "\033[38;5;207m", "\033[38;5;201m",
+    "\033[38;5;165m", "\033[38;5;129m",
+]
+
+
+def _render_block_text(text: str) -> list[str]:
+    """Render a string into 5-line block-character art."""
+    lines = [""] * 5
+    for ch in text.upper():
+        letter = _BLOCK_LETTERS.get(ch, _BLOCK_LETTERS[' '])
+        for i in range(5):
+            lines[i] += letter[i] + " "
+    return lines
+
+
+def _typing_print(text: str, delay: float = 0.008):
+    """Print text character by character for a retro typing effect."""
+    for ch in text:
+        sys.stdout.write(ch)
+        sys.stdout.flush()
+        time.sleep(delay)
+    sys.stdout.write('\n')
+    sys.stdout.flush()
+
+
+def _strip_ansi(s: str) -> str:
+    """Remove ANSI escape codes for length calculation."""
+    import re
+    return re.sub(r'\033\[[^m]*m', '', s)
+
+
+def _display_width(s: str) -> int:
+    """Calculate the actual display width of a string in the terminal.
+    
+    'W' (Wide) and 'F' (Fullwidth) characters occupy 2 columns.
+    'A' (Ambiguous) characters like █ ▄ are treated as 1 column
+    (matches Windows Terminal / modern terminal behavior).
+    """
+    import unicodedata
+    w = 0
+    for ch in s:
+        eaw = unicodedata.east_asian_width(ch)
+        if eaw in ('W', 'F'):
+            w += 2
+        else:
+            w += 1
+    return w
+
+
+def _print_banner(mode_badge: str):
+    """Print the full BBS-style banner with system info."""
+    W = 62  # inner width
+    BORDER = "\033[38;5;244m"
+    top    = f"{BORDER}╔{'═' * W}╗{C.RESET}"
+    bottom = f"{BORDER}╚{'═' * W}╝{C.RESET}"
+    sl     = f"{BORDER}║{C.RESET}"
+    sr     = f"{BORDER}║{C.RESET}"
+    sep    = f"\033[38;5;238m╠{'─' * W}╣{C.RESET}"
+    blank  = f"{sl}{' ' * W}{sr}"
+
+    print(top)
+    print(blank)
+
+    # ── MULTI AI (cyan gradient)
+    for i, row in enumerate(_render_block_text("MULTI AI")):
+        colored = f"{_GRAD_CYAN[i]}{C.BOLD}{row}{C.RESET}"
+        pad = W - _display_width(row)
+        lp = pad // 2
+        rp = pad - lp
+        print(f"{sl}{' ' * lp}{colored}{' ' * rp}{sr}")
+
+    print(blank)
+
+    # ── RELAY HUB (pink gradient)
+    for i, row in enumerate(_render_block_text("RELAY HUB")):
+        colored = f"{_GRAD_PINK[i]}{C.BOLD}{row}{C.RESET}"
+        pad = W - _display_width(row)
+        lp = pad // 2
+        rp = pad - lp
+        print(f"{sl}{' ' * lp}{colored}{' ' * rp}{sr}")
+
+    print(blank)
+    print(sep)
+
+    # ── Subtitle
+    sub = "≡ Multi-AI Code Discussion Panel ≡"
+    pad = W - _display_width(sub)
+    lp = pad // 2
+    rp = pad - lp
+    print(f"{sl}{' ' * lp}\033[38;5;229m{C.BOLD}{sub}{C.RESET}{' ' * rp}{sr}")
+    print(sep)
+
+    # ── AI lineup
+    ai_txt = (
+        f"    {C.CLAUDE}{C.BOLD}◈ CLAUDE{C.RESET}"
+        f"      {C.CODEX}{C.BOLD}■ CODEX{C.RESET}"
+        f"      {C.GEMINI}{C.BOLD}▲ GEMINI{C.RESET}"
+    )
+    vis = _display_width(_strip_ansi(ai_txt))
+    print(f"{sl}{ai_txt}{' ' * (W - vis)}{sr}")
+    print(sep)
+
+    # ── System info lines
+    syslines = [
+        ("Mode: ", mode_badge),
+        ("", f"{C.MUTED}Type message → all three AIs respond in parallel{C.RESET}"),
+        ("", f"{C.MUTED}Empty Enter  → AIs react to each other's replies{C.RESET}"),
+        ("", f"{C.MUTED}exit / quit  → leave     Ctrl+U → clear line{C.RESET}"),
+        ("", f"{C.MUTED}/help        → show all commands{C.RESET}"),
+    ]
+    for extra, content in syslines:
+        prefix = f"  {C.DIM}SYS▸{C.RESET} {extra}"
+        vis_len = _display_width(_strip_ansi(prefix)) + _display_width(_strip_ansi(content))
+        rp = max(W - vis_len, 0)
+        print(f"{sl}{prefix}{content}{' ' * rp}{sr}")
+
+    print(blank)
+    print(bottom)
+    print()
+
+
 # ─── Main loop ────────────────────────────────────────────────────────────────
 
 def main():
@@ -424,19 +567,18 @@ def main():
     history = []
 
     if RELAY_MODE == "readonly":
-        mode_badge = f"{C.OK}readonly \U0001f512{C.RESET}"
+        mode_badge = f"{C.OK}readonly [RO]{C.RESET}"
     else:
-        mode_badge = f"{C.WARN}full \u26a0\ufe0f{C.RESET}"
+        mode_badge = f"{C.WARN}full [RW]{C.RESET}"
 
     print()
-    print(f"{C.BANNER}{C.BOLD}  {'═' * 50}{C.RESET}")
-    print(f"{C.BANNER}{C.BOLD}    Multi-AI Code Discussion Panel{C.RESET}")
-    print(f"{C.BANNER}{C.BOLD}    {C.CLAUDE}◈ Claude{C.BANNER}  {C.CODEX}■ Codex{C.BANNER}  {C.GEMINI}▲ Gemini{C.RESET}")
-    print(f"{C.BANNER}{C.BOLD}  {'═' * 50}{C.RESET}")
-    print(f"  {C.DIM}Mode: {C.RESET}{mode_badge}")
-    print(f"  {C.DIM}Type message \u2192 all three AIs respond in parallel{C.RESET}")
-    print(f"  {C.DIM}Empty Enter  \u2192 AIs react to each other's replies{C.RESET}")
-    print(f"  {C.DIM}exit / quit  \u2192 leave     Ctrl+U \u2192 clear line{C.RESET}")
+    _print_banner(mode_badge)
+
+    # Retro typing effect for "system online" message
+    _typing_print(
+        f"{C.MUTED}  ░▒▓ System Online ▓▒░  Ready for input...{C.RESET}",
+        delay=0.015
+    )
     print()
 
     round_num = 0
@@ -459,9 +601,9 @@ def main():
                 if len(cmd) >= 2 and cmd[1] in ("readonly", "full"):
                     RELAY_MODE = cmd[1]
                     if RELAY_MODE == "readonly":
-                        badge = f"{C.OK}readonly \U0001f512{C.RESET}"
+                        badge = f"{C.OK}readonly [RO]{C.RESET}"
                     else:
-                        badge = f"{C.WARN}full \u26a0\ufe0f{C.RESET}"
+                        badge = f"{C.WARN}full [RW]{C.RESET}"
                     print(f"  {C.DIM}Mode switched to:{C.RESET} {badge}")
                 else:
                     cur = f"{C.OK}readonly{C.RESET}" if RELAY_MODE == "readonly" else f"{C.WARN}full{C.RESET}"
@@ -509,4 +651,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
