@@ -363,20 +363,99 @@ def _read_input(prompt: str) -> str:
             sys.stdout.write(ch)
             sys.stdout.flush()
 
+# ─── Syntax Highlighting ──────────────────────────────────────────────────────
+
+def _highlight_code_blocks(text: str) -> str:
+    """Replace ```lang ... ``` fenced code blocks with syntax-highlighted versions.
+    
+    Falls back to plain text if pygments is not installed.
+    """
+    try:
+        from pygments import highlight as _hl
+        from pygments.lexers import get_lexer_by_name, TextLexer
+        from pygments.formatters import Terminal256Formatter
+        from pygments.util import ClassNotFound
+    except ImportError:
+        return text  # pygments not available; return as-is
+
+    import re
+    _FENCE = re.compile(
+        r"^```(\w*)\s*\n(.*?)^```\s*$",
+        re.MULTILINE | re.DOTALL,
+    )
+    formatter = Terminal256Formatter(style="monokai")
+
+    def _replace(m):
+        lang = m.group(1).strip().lower()
+        code = m.group(2)
+        try:
+            lexer = get_lexer_by_name(lang) if lang else TextLexer()
+        except ClassNotFound:
+            lexer = TextLexer()
+        header = f"{C.MUTED}─── {lang or 'code'} ───{C.RESET}"
+        footer = f"{C.MUTED}{'─' * (len(lang or 'code') + 8)}{C.RESET}"
+        highlighted = _hl(code, lexer, formatter).rstrip('\n')
+        return f"{header}\n{highlighted}\n{footer}"
+
+    return _FENCE.sub(_replace, text)
+
+
 # ─── Display ──────────────────────────────────────────────────────────────────
 
+def _get_term_width() -> int:
+    """Get terminal width, default 80."""
+    try:
+        return shutil.get_terminal_size().columns
+    except Exception:
+        return 80
+
+
+def _wrap_text(text: str, width: int) -> list[str]:
+    """Wrap text to fit within a given width, preserving existing newlines."""
+    result = []
+    for line in text.split('\n'):
+        if len(line) <= width:
+            result.append(line)
+        else:
+            # Simple word wrap
+            while len(line) > width:
+                # Find last space within width
+                brk = line.rfind(' ', 0, width)
+                if brk <= 0:
+                    brk = width
+                result.append(line[:brk])
+                line = line[brk:].lstrip()
+            if line:
+                result.append(line)
+    return result
+
+
 def print_responses(responses: dict):
+    tw = _get_term_width()
+    box_w = tw - 1  # leave 1 char margin on right
+
     print()
     for name in ["claude", "codex", "gemini"]:
         resp = responses.get(name, "(no response)")
+        resp = _highlight_code_blocks(resp)
         color = AI_COLORS[name]
         icon  = AI_ICONS[name]
-        label = f"{color}{C.BOLD}  {icon} {name.upper()}{C.RESET}"
-        line  = f"{C.LINE}{'\u2500' * 60}{C.RESET}"
-        print(line)
-        print(label)
-        print(line)
-        print(resp)
+
+        # ── Header: ╭─ ◈ CLAUDE ─────────╮ style, full width ──
+        header_text = f" {icon} {name.upper()} "
+        hpad = box_w - len(header_text) - 2  # -2 for ╭ and ╮ (but no right cap)
+        top = f"{color}╭─{header_text}{'─' * hpad}{C.RESET}"
+
+        # ── Bottom line ──
+        bottom = f"{color}╰{'─' * (box_w - 1)}{C.RESET}"
+
+        # ── Left border ──
+        side_l = f"{color}│{C.RESET}"
+
+        print(top)
+        for ln in resp.split('\n'):
+            print(f"{side_l} {ln}")
+        print(bottom)
         print()
 
 
@@ -406,15 +485,32 @@ def print_round_summary(diagnostics: dict, round_num: int):
 
 
 def _spinner(stop_event: threading.Event, msg: str):
-    """Animated spinner shown while waiting for AI responses."""
-    frames = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"]
+    """Retro BBS-style progress bar animation while waiting for AI responses."""
+    bar_len = 20
     i = 0
+    ai_names = [
+        f"{C.CLAUDE}Claude{C.RESET}",
+        f"{C.CODEX}Codex{C.RESET}",
+        f"{C.GEMINI}Gemini{C.RESET}",
+    ]
     while not stop_event.is_set():
-        sys.stdout.write(f"\r{C.BANNER}  {frames[i % len(frames)]} {msg}{C.RESET}  ")
+        # Bouncing progress bar effect
+        pos = i % (bar_len * 2)
+        if pos >= bar_len:
+            pos = bar_len * 2 - pos
+        filled = pos
+        empty = bar_len - filled
+        bar = f"{C.BANNER}[{'█' * filled}{'░' * empty}]{C.RESET}"
+
+        # Cycle which AI name is shown
+        ai_label = ai_names[i % len(ai_names)]
+
+        sys.stdout.write(f"\r  {bar} {C.MUTED}Waiting for{C.RESET} {ai_label}{C.MUTED}...{C.RESET}  ")
         sys.stdout.flush()
         i += 1
-        stop_event.wait(0.1)
-    sys.stdout.write(f"\r{' ' * (len(msg) + 10)}\r")
+        stop_event.wait(0.08)
+    # Clear the line
+    sys.stdout.write(f"\r{' ' * 70}\r")
     sys.stdout.flush()
 
 # ─── BBS-Style ASCII Art Banner ──────────────────────────────────────────────
@@ -579,6 +675,21 @@ def main():
         f"{C.MUTED}  ░▒▓ System Online ▓▒░  Ready for input...{C.RESET}",
         delay=0.015
     )
+
+    # Check syntax highlighting availability
+    try:
+        import pygments
+        _typing_print(
+            f"{C.MUTED}  ✦ Syntax highlighting: {C.OK}enabled{C.RESET}",
+            delay=0.010
+        )
+    except ImportError:
+        _typing_print(
+            f"{C.MUTED}  ✦ Syntax highlighting: {C.WARN}off{C.RESET}"
+            f"{C.MUTED} (pip install pygments){C.RESET}",
+            delay=0.010
+        )
+
     print()
 
     round_num = 0
@@ -651,3 +762,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
