@@ -11,7 +11,7 @@ Instead of asking the same question in three different chat interfaces, you can 
 - **Multi-Model Support**: Interfaces seamlessly with `claude-code`, `codex`, and `gemini` CLIs.
 - **Cross-Validation**: Let the AIs review and critique each other's code suggestions.
 - **Context-Aware**: The bots share the same conversation history context and know who is speaking via `[speaker]` tags.
-- **Cross-Platform**: Handles Windows CMD truncation, TTY buffering issues, and encoding safely (works flawlessly on Windows, macOS, and Linux).
+- **Cross-Platform**: Uses stdin for prompts and avoids Windows batch shims.
 - **Project-Aware**: AI models execute in your current working directory, granting them access to analyze, read, and modify your local codebase.
 
 ## 🏗️ Architecture
@@ -21,19 +21,20 @@ This module provides a turn-based execution architecture:
 ### The Turn-Based Panel (`relay.py`)
 
 - **How it works**: Spawns a new CLI process for each AI _every time_ you send a message, injecting the entire conversation history into the prompt.
-- **Pros**: Highly stable, zero zombie processes.
+- **Pros**: Isolated one-shot sessions with process-tree cleanup on timeout or Ctrl+C.
 - **Cons**: Slower response times due to CLI startup overhead on every turn.
 - **Best for**: Deep, deliberate code reviews and architectural planning where you need time to digest long answers.
 
 ### File Structure
 
-```
-cli/
+```text
+Multi-AI-Relay-Hub/
 ├── relay.py              # Main entry point
 ├── cli_common.py         # Shared CLI resolution utilities
 ├── run_claude_cli.py     # Claude Code wrapper
 ├── run_codex_cli.py      # Codex wrapper
 ├── run_gemini_cli.py     # Gemini wrapper
+├── tests/                # Offline unit tests
 ├── requirements.txt      # Python dependencies
 └── .env.example          # Environment variable template
 ```
@@ -41,13 +42,13 @@ cli/
 ## 🛠️ Prerequisites
 
 1. **Python 3.10+**
-2. **Node.js** (Required for all three CLI tools)
+2. **Node.js** (required for npm-installed Codex and Gemini CLI)
 3. **The AI CLIs**: You must install and authenticate the respective CLI tools before using the hub:
-   - [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) (`npm install -g @anthropic-ai/claude-code`)
-   - [Gemini CLI](https://github.com/google/gemini-cli) (`npm install -g @anthropic-ai/gemini-cli` or `npm install -g @google/gemini-cli`)
+   - [Claude Code](https://code.claude.com/docs/en/setup) (use Anthropic's native installer)
+   - [Gemini CLI](https://github.com/google/gemini-cli) (`npm install -g @google/gemini-cli`)
    - [Codex CLI](https://github.com/openai/codex) (`npm install -g @openai/codex`)
 
-4. **Python dependencies**: `pip install -r requirements.txt` (only `python-dotenv` for `.env` auto-loading; optional but recommended)
+4. **Python dependencies**: `pip install -r requirements.txt`
 
 ## ⚙️ Initial Setup & Authentication
 
@@ -75,13 +76,19 @@ python /path/to/cli/relay.py
 
 ### Configuration
 
-Copy `.env.example` to `.env` and adjust as needed, or set environment variables directly:
+Copy `.env.example` beside `relay.py` as `.env`, or set environment variables directly. The relay deliberately does not auto-load the target project's `.env`.
 
-| Variable            | Default    | Description                                                            |
-| ------------------- | ---------- | ---------------------------------------------------------------------- |
-| `RELAY_TIMEOUT_SEC` | `600`      | Timeout (seconds) for each AI subprocess                               |
-| `MAX_CONTEXT_CHARS` | `32000`    | Maximum context characters sent to each AI                             |
-| `RELAY_MODE`        | `readonly` | `readonly` = AIs cannot write files; `full` = AIs can use tools freely |
+| Variable            | Default    | Description                                                      |
+| ------------------- | ---------- | ---------------------------------------------------------------- |
+| `RELAY_TIMEOUT_SEC` | `600`      | Timeout (seconds) for each AI subprocess                         |
+| `MAX_CONTEXT_CHARS` | `32000`    | Maximum relay conversation characters sent to each AI            |
+| `RELAY_MODE`        | `readonly` | `readonly` = all read-only; `full` = selected executor may write |
+| `RELAY_EXECUTOR`    | `codex`    | The only writer in `full` mode: `claude`, `codex`, or `gemini`   |
+
+Runtime commands:
+
+- `/mode readonly|full` changes the permission mode for later rounds.
+- `/executor claude|codex|gemini` selects the sole writer used by `full` mode.
 
 ### The "Empty Enter" Trick
 
@@ -97,7 +104,7 @@ To bypass complex TTY handling and interactive CLI constraints, the hub uses **W
 
 1. `relay.py` wraps your message in a JSON payload.
 2. The payload is piped into the wrappers.
-3. The wrapper scripts parse the JSON, prepend the `[human]` or `[ai]` tags, inject a `SYSTEM_PROMPT` emphasizing their role in a multi-AI room, and execute the actual CLI binaries using `subprocess.run`.
+3. The wrappers parse the JSON and pass the complete prompt to each CLI over stdin, preserving newlines and avoiding command-line length limits.
 4. The outputs are captured, buffered, and returned to the hub for display.
 
 ### SYSTEM_PROMPT Anti-Narration
@@ -106,25 +113,23 @@ Each wrapper's `SYSTEM_PROMPT` includes **anti-narration** instructions that tel
 
 ### Auto-Approval Flags & `RELAY_MODE`
 
-Each wrapper includes a flag to auto-approve tool operations (file read/write, command execution). **These flags are only enabled when `RELAY_MODE=full`.**
+Permissions are explicit rather than relying on each CLI's defaults. In `full` mode, only `RELAY_EXECUTOR` receives write permission; the other two remain read-only.
 
-By default, `RELAY_MODE=readonly` — all bypass flags are stripped, and the AIs operate in read-only mode.
-
-| CLI    | Flag                                         | Effect                               |
-| ------ | -------------------------------------------- | ------------------------------------ |
-| Claude | `--permission-mode bypassPermissions`        | Skips all tool confirmation prompts  |
-| Codex  | `--dangerously-bypass-approvals-and-sandbox` | Skips approvals and disables sandbox |
-| Gemini | `--yolo`                                     | Auto-approves all tool actions       |
+| CLI    | `readonly` mode             | Selected executor in `full` mode |
+| ------ | --------------------------- | -------------------------------- |
+| Claude | `--permission-mode plan`    | `bypassPermissions`              |
+| Codex  | `--sandbox read-only`       | `--sandbox workspace-write`      |
+| Gemini | `--approval-mode plan`      | `--approval-mode yolo`           |
 
 ## 🔴 Safety Notice (Important)
 
 > [!CAUTION]
-> **When `RELAY_MODE=full`, AI agents can automatically execute file operations without manual approval.**
+> **When `RELAY_MODE=full`, the selected executor can execute file operations without interactive approval.**
 >
-> In `full` mode, the wrappers use auto-approval flags so the AIs can modify files immediately. This means they may create, modify, overwrite, or even delete files.
+> Claude and Gemini use their auto-approval modes; Codex is limited to its workspace-write sandbox. The two reviewers remain read-only.
 > **You are effectively giving full write permission to an LLM.**
 >
-> The default mode is `readonly`, which disables all auto-approval flags.
+> The default mode is explicit read-only for all three CLIs.
 
 ### ✅ Recommended environments:
 
@@ -145,18 +150,19 @@ By default, `RELAY_MODE=readonly` — all bypass flags are stripped, and the AIs
 
 ## 🔧 Windows-Specific: CLI Path Resolution
 
-On Windows, the wrapper scripts execute the AI CLIs by calling `node` directly against their `.js` entry points, instead of going through `.cmd` wrapper files. This avoids two common pitfalls:
+On Windows, native executables are run directly. npm-installed CLIs are resolved to their `.js` entry points and launched with Node; `.cmd` and `.bat` shims are never executed.
 
 - **Stray `.bat`/`.cmd` files in the current directory** being picked up before the real CLI (Windows searches cwd first).
-- **`.cmd` wrapper files spawning unwanted `cmd.exe` windows.** Running `node cli.js` directly is completely silent.
+- **Batch-shim argument injection and cmd.exe's 8191-character command-line limit.**
 
 ### How Path Resolution Works
 
 `cli_common.py` resolves CLI paths in this order:
 
-1. **Known `.js` entry points** under the npm global directory (`%APPDATA%\npm\`)
-2. **Parse the `.cmd` file** to extract the actual `.js` path
-3. **Fallback** to the full-path `.cmd` file (not cwd-relative)
+1. A native executable found on `PATH` (for example modern Claude Code).
+2. A known `.js` entry point under the npm global directory.
+3. Safe parsing of `%~dp0` or `%dp0%` npm shims to locate the `.js` file.
+4. Refuse execution if only an unresolved `.cmd`/`.bat` shim is available.
 
 ### Default `.js` Entry Points
 
@@ -177,7 +183,7 @@ The wrapper scripts search for these paths (relative to your npm global director
 **Gemini CLI** (`run_gemini_cli.py`):
 
 ```
-%APPDATA%\npm\node_modules\@google\gemini-cli\dist\index.js
+%APPDATA%\npm\node_modules\@google\gemini-cli\bundle\gemini.js
 ```
 
 ### Finding Your CLI Entry Point
@@ -195,7 +201,7 @@ type "%APPDATA%\npm\claude.cmd"
 dir "%APPDATA%\npm\node_modules\@anthropic-ai\claude-code\*.js" /b
 ```
 
-Then update the `CLI_JS_CANDIDATES` list at the top of the relevant wrapper script:
+You can set `CLAUDE_CLI_PATH`, `CODEX_CLI_PATH`, or `GEMINI_CLI_PATH` to a native executable or `.js` entry point. Batch files are intentionally rejected. Alternatively, add a verified path to the relevant candidate list:
 
 ```python
 # Example: run_claude_cli.py
@@ -212,4 +218,12 @@ On Linux and macOS, path resolution simply uses `shutil.which()` to find the CLI
 
 > ⚠️ **Important**: Do not place files named `claude.bat`, `codex.bat`, or `gemini.bat` in your working directory. While the resolver is designed to avoid them, removing potential conflicts is the safest approach.
 
-_Note: Special care has been taken in the wrappers to bypass Windows `cmd.exe` string truncation by escaping horizontal newlines (`\n`)._
+Prompts are passed over stdin, so Markdown and code-block newlines are preserved and prompt size is not constrained by Windows command-line limits.
+
+## Tests
+
+The test suite is offline and mocks all three AI CLI calls:
+
+```bash
+python -m unittest discover -s tests -v
+```

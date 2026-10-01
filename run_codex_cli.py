@@ -13,9 +13,6 @@ import json
 
 from cli_common import find_cli_args, get_project_cwd
 
-sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8', errors='ignore')
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='ignore', write_through=True)
-
 SYSTEM_PROMPT = (
     "Your identity is [codex]. You are participating in a multi-AI chat room. "
     "Messages you receive are prefixed with [speaker_name] tags "
@@ -39,74 +36,58 @@ CLI_JS_CANDIDATES = [
 ]
 
 try:
-    RELAY_TIMEOUT_SEC = int(os.environ.get("RELAY_TIMEOUT_SEC", 600))
+    RELAY_TIMEOUT_SEC = max(1, int(os.environ.get("RELAY_TIMEOUT_SEC", 600)))
 except (ValueError, TypeError):
     RELAY_TIMEOUT_SEC = 600
 
-RELAY_MODE = os.environ.get("RELAY_MODE", "readonly").lower().strip()
+RELAY_MODE = os.environ.get(
+    "RELAY_AGENT_MODE", os.environ.get("RELAY_MODE", "readonly")
+).lower().strip()
+
+
+def _configure_stdio() -> None:
+    if hasattr(sys.stdin, "buffer"):
+        sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
+    if hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(
+            sys.stdout.buffer, encoding="utf-8", errors="replace", write_through=True
+        )
 
 
 def call_codex(message: str) -> str:
-    try:
-        # Prepend system prompt for identity
-        full_message = f"{SYSTEM_PROMPT}\n\n{message}"
-        safe_message = full_message.replace("\n", " \\n ")
-
-        args = find_cli_args("codex", CLI_JS_CANDIDATES)
-        args.extend([
-            "exec",
-            "--json",
-            "--skip-git-repo-check",
-        ])
-        if RELAY_MODE == "full":
-            args.append("--dangerously-bypass-approvals-and-sandbox")  # ★ full 模式才自動批准
-        args.append(safe_message)
-
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            timeout=RELAY_TIMEOUT_SEC,
-            creationflags=0x08000000 if sys.platform == "win32" else 0,
-            cwd=get_project_cwd(),
-            stdin=subprocess.DEVNULL,
-        )
-
-        # 解析 JSONL 輸出
-        agent_response = []
-        for line in result.stdout.splitlines():
-            try:
-                data = json.loads(line)
-                if data.get("type") == "item.completed":
-                    item = data.get("item", {})
-                    if item.get("type") == "agent_message":
-                        agent_response.append(item.get("text", ""))
-            except Exception:
-                continue
-
-        if agent_response:
-            return "\n".join(agent_response).strip()
-
-        fallback = result.stdout.strip()
-        if "agent_message" not in fallback and result.returncode != 0:
-            print(f"[codex error] {result.stderr}", file=sys.stderr)
-            return ""
-        return fallback
-
-    except subprocess.TimeoutExpired:
-        print(f"[codex wrapper] Timeout after {RELAY_TIMEOUT_SEC}s", file=sys.stderr)
-        return ""
-    except FileNotFoundError:
-        print("[codex wrapper] codex CLI not found", file=sys.stderr)
-        return ""
-    except Exception as e:
-        print(f"[codex wrapper error] {e}", file=sys.stderr)
-        return ""
+    args = find_cli_args("codex", CLI_JS_CANDIDATES)
+    args.extend([
+        "exec",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--ask-for-approval", "never",
+        "--sandbox", "workspace-write" if RELAY_MODE == "full" else "read-only",
+        "-",
+    ])
+    full_message = f"{SYSTEM_PROMPT}\n\n{message}"
+    result = subprocess.run(
+        args,
+        input=full_message,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        # relay.py owns the earlier timeout so it can terminate the whole tree.
+        timeout=RELAY_TIMEOUT_SEC + 5,
+        creationflags=0x08000000 if sys.platform == "win32" else 0,
+        cwd=get_project_cwd(),
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no error output"
+        raise RuntimeError(f"Codex CLI exited with {result.returncode}: {detail[:1000]}")
+    if not result.stdout.strip():
+        raise RuntimeError("Codex CLI returned an empty response")
+    return result.stdout.strip()
 
 
 def main():
+    _configure_stdio()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -127,9 +108,14 @@ def main():
             if response:
                 print(response, flush=True)
                 print("END_OF_RESPONSE", flush=True)
+        except subprocess.TimeoutExpired:
+            print(f"[codex wrapper] Timeout after {RELAY_TIMEOUT_SEC}s", file=sys.stderr)
+            return 124
         except Exception as e:
             print(f"[codex wrapper error] {e}", file=sys.stderr)
+            return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -28,10 +28,10 @@
 
 - `RELAY_TIMEOUT_SEC`：整體超時秒數（建議預設 `600`，可依任務類型下調到 `300`）。
 - `MAX_CONTEXT_CHARS`：上下文字元上限（建議預設 `32000`，可調整為 `24000-32000`）。
+- `RELAY_MODE`：`readonly` 或 `full`；預設所有 agent 唯讀。
+- `RELAY_EXECUTOR`：`full` 模式下唯一可寫入的 agent，預設 `codex`。
 
-`.env` 載入現況：
-
-- 若程式未實作自動載入 `.env`（例如 `python-dotenv`），則需先以 shell `set/export` 將變數注入環境，`os.environ` 才能讀取。
+`.env` 僅從 `relay.py` 所在目錄載入，不讀取目標專案的 `.env`，避免把專案秘密意外傳給三套 CLI。
 
 ## 3. 每輪標準流程
 
@@ -163,8 +163,9 @@ UTF-8 建議（PowerShell）：
 
 現況聲明：
 
-- 自 v0.3 起，`RELAY_MODE=readonly`（預設）會在系統層移除各 CLI 的自動批准旗標（`bypassPermissions` / `--yolo` / `--dangerously-bypass-approvals-and-sandbox`）。
-- 需要寫入時須手動切換 `RELAY_MODE=full`，或在 `.env` 中設定。
+- 自 v0.4 起，`RELAY_MODE=readonly`（預設）會明確指定 Claude plan、Gemini plan 與 Codex read-only sandbox。
+- `RELAY_MODE=full` 時只有 `RELAY_EXECUTOR` 可寫；另外兩個 Reviewer 仍維持唯讀。
+- Codex Executor 使用 workspace-write sandbox；Claude/Gemini 的自動批准模式風險較高，僅應在可回復的工作目錄使用。
 - 即使在 `full` 模式，仍需嚴格執行「先回報計畫，再做非唯讀操作」。
 
 ## 10. 待機回覆規範（Conventions）
@@ -185,10 +186,10 @@ UTF-8 建議（PowerShell）：
 - 是否建立半自動驗證腳本（語法檢查 + JSON + UTF-8）。
 - 是否將本 SOP 精簡同步到 `AGENTS.md`。
 - 狀態摘要錨點（Status Summary Anchor）：待上下文遺失成為實際瓶頸時，再定義寫入時機、欄位格式、保留策略。
-- Runtime 模式切換指令（例如 `/mode full`），省去重啟切換 `RELAY_MODE` 的操作成本。
+- 研究 Gemini 非互動 session persistence 的穩定停用方式。
 
 ---
 
-版本：`v0.3`  
-狀態：已整合六項議題決議並同步至程式碼  
-最後更新：2026-03-05
+版本：`v0.4`
+狀態：已同步 stdin、安全模式、單一 Executor、Ctrl+C 與 CLI 路徑解析
+最後更新：2026-10-01

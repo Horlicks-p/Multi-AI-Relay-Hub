@@ -18,37 +18,50 @@ import os
 import json
 import datetime
 import threading
+import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─── .env auto-load ───────────────────────────────────────────────────────────
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
+    from dotenv import dotenv_values
+
+    allowed_relay_keys = {
+        "RELAY_TIMEOUT_SEC",
+        "MAX_CONTEXT_CHARS",
+        "RELAY_MODE",
+        "RELAY_EXECUTOR",
+        "CLAUDE_CLI_PATH",
+        "CODEX_CLI_PATH",
+        "GEMINI_CLI_PATH",
+    }
+    for key, value in dotenv_values(os.path.join(SCRIPT_DIR, ".env")).items():
+        if key in allowed_relay_keys and value is not None:
+            os.environ.setdefault(key, value)
 except ImportError:
     pass  # python-dotenv not installed; fall back to shell-exported vars
 
-# UTF-8 output on Windows
-if sys.platform == "win32":
-    # Try to set console to UTF-8
-    try:
-        subprocess.run(["chcp", "65001"], shell=True, capture_output=True)
-    except Exception:
-        pass
-
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="ignore", write_through=True)
-sys.stdin  = io.TextIOWrapper(sys.stdin.buffer,  encoding="utf-8", errors="ignore")
+def _configure_stdio() -> None:
+    """Use UTF-8 for the interactive script without import-time side effects."""
+    if hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(
+            sys.stdout.buffer, encoding="utf-8", errors="replace", write_through=True
+        )
+    if hasattr(sys.stdin, "buffer"):
+        sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 # Unified Timeout (Source of Truth)
 try:
-    TIMEOUT = int(os.environ.get("RELAY_TIMEOUT_SEC", 600))
+    TIMEOUT = max(1, int(os.environ.get("RELAY_TIMEOUT_SEC", 600)))
 except (ValueError, TypeError):
     TIMEOUT = 600
 
 # Context Management (24k-32k as agreed)
 try:
-    MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", 32000))
+    MAX_CONTEXT_CHARS = max(1024, int(os.environ.get("MAX_CONTEXT_CHARS", 32000)))
 except (ValueError, TypeError):
     MAX_CONTEXT_CHARS = 32000
 
@@ -56,11 +69,18 @@ except (ValueError, TypeError):
 # readonly = strip bypass-permissions flags from all AI wrappers
 # full     = enable bypass-permissions (AI can write/delete files)
 RELAY_MODE = os.environ.get("RELAY_MODE", "readonly").lower().strip()
+if RELAY_MODE not in {"readonly", "full"}:
+    RELAY_MODE = "readonly"
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RELAY_EXECUTOR = os.environ.get("RELAY_EXECUTOR", "codex").lower().strip()
+if RELAY_EXECUTOR not in {"claude", "codex", "gemini"}:
+    RELAY_EXECUTOR = "codex"
+
+_ACTIVE_PROCESSES: set[subprocess.Popen] = set()
+_ACTIVE_PROCESSES_LOCK = threading.Lock()
 
 
-def _non_interactive_env() -> dict:
+def _non_interactive_env(agent_name: str) -> dict:
     """Environment hints to keep CLIs in one-shot mode."""
     env = os.environ.copy()
     env.setdefault("CI", "1")
@@ -69,50 +89,91 @@ def _non_interactive_env() -> dict:
     env.setdefault("TERM", "dumb")
     env.setdefault("PYTHONUNBUFFERED", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")  # ★ Force UTF-8 for Python subprocesses
-    env["RELAY_MODE"] = RELAY_MODE  # ★ Pass mode to wrapper subprocesses
+    env["RELAY_MODE"] = RELAY_MODE
+    env["RELAY_AGENT_MODE"] = (
+        "full" if RELAY_MODE == "full" and agent_name == RELAY_EXECUTOR else "readonly"
+    )
     return env
 
 
-def _run(args: list, input_data: str = None) -> dict:
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    """Best-effort termination of a wrapper and all CLI/tool descendants."""
+    if process.poll() is not None:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=10,
+                check=False,
+            )
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+    except (OSError, subprocess.SubprocessError):
+        process.kill()
+
+
+def _terminate_all_processes() -> None:
+    with _ACTIVE_PROCESSES_LOCK:
+        processes = list(_ACTIVE_PROCESSES)
+    for process in processes:
+        _terminate_process_tree(process)
+
+
+def _run(name: str, args: list, input_data: str = None) -> dict:
     """Run a CLI wrapper and return structured result."""
     started = time.perf_counter()
     
     # Windows 專用的進程啟動標誌，確保完全隱藏視窗
     creationflags = 0
     if sys.platform == "win32":
-        # 只使用 CREATE_NO_WINDOW (0x08000000) 
-        # (絕對不可加 DETACHED_PROCESS，否則會切斷 stdin/stdout 管線導致 AI 失聰失語)
-        creationflags = 0x08000000
+        creationflags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
 
+    process = None
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             args,
-            input=input_data,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
-            errors="ignore",
-            timeout=TIMEOUT,
+            errors="replace",
             creationflags=creationflags,
-            env=_non_interactive_env(),
+            start_new_session=sys.platform != "win32",
+            env=_non_interactive_env(name),
         )
-        output = result.stdout.strip()
+        with _ACTIVE_PROCESSES_LOCK:
+            _ACTIVE_PROCESSES.add(process)
+        stdout, stderr_text = process.communicate(input=input_data, timeout=TIMEOUT)
+        output = stdout.strip()
         
         # 移除包裝腳本可能輸出的結束標記
         if output.endswith("END_OF_RESPONSE"):
             output = output[:-15].strip()
             
-        stderr = result.stderr.strip()
+        stderr = stderr_text.strip()
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         stderr_preview = stderr[:220]
 
-        if result.returncode != 0:
-            reason = stderr_preview if stderr else f"exit={result.returncode}"
+        if process.returncode != 0:
+            reason = stderr_preview if stderr else f"exit={process.returncode}"
             return {
                 "status": "error",
-                "text": output or f"[error exit={result.returncode}] {reason}",
+                "text": output or f"[error exit={process.returncode}] {reason}",
                 "reason": reason,
-                "exit_code": result.returncode,
+                "exit_code": process.returncode,
                 "elapsed_ms": elapsed_ms,
                 "stderr_preview": stderr_preview,
                 "stdout_chars": len(output),
@@ -142,6 +203,12 @@ def _run(args: list, input_data: str = None) -> dict:
             "stdout_chars": len(output),
         }
     except subprocess.TimeoutExpired:
+        if process is not None:
+            _terminate_process_tree(process)
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         return {
             "status": "timeout",
@@ -152,6 +219,10 @@ def _run(args: list, input_data: str = None) -> dict:
             "stderr_preview": "",
             "stdout_chars": 0,
         }
+    except KeyboardInterrupt:
+        if process is not None:
+            _terminate_process_tree(process)
+        raise
     except Exception as e:
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         return {
@@ -163,6 +234,10 @@ def _run(args: list, input_data: str = None) -> dict:
             "stderr_preview": "",
             "stdout_chars": 0,
         }
+    finally:
+        if process is not None:
+            with _ACTIVE_PROCESSES_LOCK:
+                _ACTIVE_PROCESSES.discard(process)
 
 
 def call_wrapper(name: str, prompt: str) -> dict:
@@ -182,7 +257,7 @@ def call_wrapper(name: str, prompt: str) -> dict:
     }
     input_json = json.dumps(msg_obj, ensure_ascii=False) + "\n"
     
-    return _run([sys.executable, "-u", script], input_data=input_json)
+    return _run(name, [sys.executable, "-u", script], input_data=input_json)
 
 
 CALLERS = {
@@ -194,15 +269,20 @@ CALLERS = {
 # ─── History formatting ───────────────────────────────────────────────────────
 
 def build_prompt(history: list, human_msg: str) -> str:
-    """Build prompt with round-based truncation to keep boundaries intact."""
+    """Build a size-bounded prompt while preserving complete history rounds."""
+    prefix = "[human] "
+    truncation_marker = "\n[input truncated]"
+    max_human_chars = max(1, MAX_CONTEXT_CHARS - len(prefix) - len(truncation_marker))
+    if len(human_msg) > max_human_chars:
+        human_msg = human_msg[:max_human_chars] + truncation_marker
+    human_text = f"{prefix}{human_msg}"
     if not history:
-        return f"[human] {human_msg}"
-    
+        return human_text
+
+    history_budget = max(0, MAX_CONTEXT_CHARS - len(human_text) - 2)
     rounds = []
     current_chars = 0
-    # Add rounds from newest to oldest until limit reached
     for turn in reversed(history):
-        # Format this specific turn
         turn_parts = [f"[human] {turn['human']}"]
         for name in ["claude", "codex", "gemini"]:
             resp = turn["responses"].get(name, "")
@@ -210,8 +290,7 @@ def build_prompt(history: list, human_msg: str) -> str:
                 turn_parts.append(f"[{name}] {resp}")
         turn_text = "\n\n".join(turn_parts)
         
-        # Check if adding this round exceeds the limit
-        if current_chars + len(turn_text) + 2 > MAX_CONTEXT_CHARS:
+        if current_chars + len(turn_text) + 2 > history_budget:
             break
         
         rounds.insert(0, turn_text)
@@ -219,9 +298,13 @@ def build_prompt(history: list, human_msg: str) -> str:
     
     context = "\n\n".join(rounds)
     if len(history) > len(rounds):
-        context = f"[history truncated; showing latest {len(rounds)} rounds]\n\n{context}"
+        notice = f"[history truncated; showing latest {len(rounds)} rounds]"
+        candidate = f"{notice}\n\n{context}" if context else notice
+        if len(candidate) <= history_budget:
+            context = candidate
     
-    return f"{context}\n\n[human] {human_msg}" if context else f"[human] {human_msg}"
+    prompt = f"{context}\n\n{human_text}" if context else human_text
+    return prompt
 
 # ─── Ask all AIs in parallel ──────────────────────────────────────────────────
 
@@ -230,7 +313,9 @@ def ask_all(human_msg: str, history: list) -> tuple[dict, dict]:
 
     responses = {}
     diagnostics = {}
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    pool = ThreadPoolExecutor(max_workers=3)
+    futures = {}
+    try:
         futures = {pool.submit(fn, prompt): name for name, fn in CALLERS.items()}
         for future in as_completed(futures):
             name = futures[future]
@@ -253,7 +338,24 @@ def ask_all(human_msg: str, history: list) -> tuple[dict, dict]:
                     "exit_code": None,
                     "stdout_chars": 0,
                 }
+    except KeyboardInterrupt:
+        _terminate_all_processes()
+        for future in futures:
+            future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
     return responses, diagnostics
+
+
+def successful_responses(responses: dict, diagnostics: dict) -> dict:
+    """Return only model answers that are safe to include in later prompts."""
+    return {
+        name: text
+        for name, text in responses.items()
+        if diagnostics.get(name, {}).get("status") == "ok"
+    }
 
 # ─── ANSI Colors ─────────────────────────────────────────────────────────────
 
@@ -304,7 +406,7 @@ def _read_input(prompt: str) -> str:
     to prevent accidental history recall. Supports paste via Ctrl+V.
     On other OS: falls back to standard input().
     """
-    if sys.platform != "win32":
+    if sys.platform != "win32" or not sys.stdin.isatty():
         return input(prompt)
 
     import msvcrt
@@ -461,7 +563,8 @@ def print_responses(responses: dict):
 
 def print_round_summary(diagnostics: dict, round_num: int):
     now_iso = datetime.datetime.now().astimezone().isoformat(timespec='seconds')
-    print(f"{C.MUTED}{'\u2500' * 60}")
+    rule = "\u2500" * 60
+    print(f"{C.MUTED}{rule}")
     print(f"  Round {round_num}  \u2502  {now_iso}{C.RESET}")
     for name in ["claude", "codex", "gemini"]:
         info = diagnostics.get(name, {})
@@ -480,7 +583,7 @@ def print_round_summary(diagnostics: dict, round_num: int):
         secs = elapsed_ms / 1000
         print(f"  {badge} {color}{name:<6}{C.RESET}  "
               f"{C.MUTED}{secs:>6.1f}s  {stdout_chars:>5} chars{C.RESET}")
-    print(f"{C.MUTED}{'\u2500' * 60}{C.RESET}")
+    print(f"{C.MUTED}{rule}{C.RESET}")
     print()
 
 
@@ -505,7 +608,10 @@ def _spinner(stop_event: threading.Event, msg: str):
         # Cycle which AI name is shown
         ai_label = ai_names[i % len(ai_names)]
 
-        sys.stdout.write(f"\r  {bar} {C.MUTED}Waiting for{C.RESET} {ai_label}{C.MUTED}...{C.RESET}  ")
+        sys.stdout.write(
+            f"\r  {bar} {C.MUTED}{msg}{C.RESET} "
+            f"{ai_label}{C.MUTED}...{C.RESET}  "
+        )
         sys.stdout.flush()
         i += 1
         stop_event.wait(0.08)
@@ -659,13 +765,14 @@ def _print_banner(mode_badge: str):
 # ─── Main loop ────────────────────────────────────────────────────────────────
 
 def main():
-    global RELAY_MODE
+    global RELAY_MODE, RELAY_EXECUTOR
+    _configure_stdio()
     history = []
 
     if RELAY_MODE == "readonly":
         mode_badge = f"{C.OK}readonly [RO]{C.RESET}"
     else:
-        mode_badge = f"{C.WARN}full [RW]{C.RESET}"
+        mode_badge = f"{C.WARN}full [RW: {RELAY_EXECUTOR}]{C.RESET}"
 
     print()
     _print_banner(mode_badge)
@@ -714,15 +821,27 @@ def main():
                     if RELAY_MODE == "readonly":
                         badge = f"{C.OK}readonly [RO]{C.RESET}"
                     else:
-                        badge = f"{C.WARN}full [RW]{C.RESET}"
+                        badge = f"{C.WARN}full [RW: {RELAY_EXECUTOR}]{C.RESET}"
                     print(f"  {C.DIM}Mode switched to:{C.RESET} {badge}")
                 else:
                     cur = f"{C.OK}readonly{C.RESET}" if RELAY_MODE == "readonly" else f"{C.WARN}full{C.RESET}"
                     print(f"  {C.DIM}Current mode:{C.RESET} {cur}")
                     print(f"  {C.DIM}Usage: /mode readonly  or  /mode full{C.RESET}")
                 continue
+            elif cmd[0] == "/executor":
+                if len(cmd) >= 2 and cmd[1] in ("claude", "codex", "gemini"):
+                    RELAY_EXECUTOR = cmd[1]
+                    print(
+                        f"  {C.DIM}Executor switched to:{C.RESET} "
+                        f"{AI_COLORS[RELAY_EXECUTOR]}{RELAY_EXECUTOR}{C.RESET}"
+                    )
+                else:
+                    print(f"  {C.DIM}Current executor:{C.RESET} {RELAY_EXECUTOR}")
+                    print(f"  {C.DIM}Usage: /executor claude|codex|gemini{C.RESET}")
+                continue
             elif cmd[0] == "/help":
                 print(f"  {C.DIM}/mode [readonly|full]  \u2192 switch permission mode{C.RESET}")
+                print(f"  {C.DIM}/executor <name>      \u2192 choose the only writer in full mode{C.RESET}")
                 print(f"  {C.DIM}/help                 \u2192 show this help{C.RESET}")
                 print(f"  {C.DIM}Empty Enter           \u2192 AIs react to each other{C.RESET}")
                 print(f"  {C.DIM}exit / quit            \u2192 leave{C.RESET}")
@@ -749,17 +868,23 @@ def main():
         )
         spin_thread.start()
 
-        responses, diagnostics = ask_all(human_msg, history)
-
-        stop_spin.set()
-        spin_thread.join()
+        try:
+            responses, diagnostics = ask_all(human_msg, history)
+        except KeyboardInterrupt:
+            _terminate_all_processes()
+            print(f"\n{C.WARN}Round interrupted; child processes were terminated.{C.RESET}")
+            continue
+        finally:
+            stop_spin.set()
+            spin_thread.join()
 
         print_responses(responses)
         print_round_summary(diagnostics, round_num)
 
-        history.append({"human": human_msg, "responses": responses})
+        clean_responses = successful_responses(responses, diagnostics)
+        if clean_responses:
+            history.append({"human": human_msg, "responses": clean_responses})
 
 
 if __name__ == "__main__":
     main()
-

@@ -1,5 +1,5 @@
 """
-cli_common.py — Shared utilities for AI CLI wrapper scripts.
+cli_common.py — Shared utilities for safe AI CLI wrapper scripts.
 
 Provides safe CLI resolution on Windows that avoids:
   1. shutil.which() picking up stray .bat/.cmd files in the current directory
@@ -7,9 +7,14 @@ Provides safe CLI resolution on Windows that avoids:
 """
 
 import os
+import re
 import sys
 import shutil
 import subprocess
+from pathlib import Path
+
+
+WINDOWS_SHIM_SUFFIXES = {".bat", ".cmd"}
 
 
 def get_project_cwd() -> str:
@@ -56,109 +61,84 @@ def find_npm_global_dir() -> str | None:
 
 # ── CLI argument resolution ───────────────────────────────────────────────────
 
+def _node_command(js_path: str) -> list[str]:
+    return [shutil.which("node") or "node", os.path.normpath(js_path)]
+
+
+def _parse_windows_npm_shim(cmd_file: str) -> list[str] | None:
+    """Resolve an npm Node entry point without executing its .cmd shim."""
+    try:
+        text = Path(cmd_file).read_text(encoding="utf-8", errors="strict")
+    except (OSError, UnicodeError):
+        return None
+
+    base_dir = str(Path(cmd_file).resolve().parent)
+    patterns = (
+        r'"%~dp0([^"\r\n]+\.js)"',
+        r'"%dp0%\\?([^"\r\n]+\.js)"',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        relative = match.group(1).lstrip("\\/").replace("\\", os.sep)
+        candidate = os.path.join(base_dir, relative)
+        if os.path.isfile(candidate):
+            return _node_command(candidate)
+    return None
+
+
 def find_cli_args(cli_name: str, js_candidates: list[str]) -> list[str]:
+    """Resolve a safe executable argv prefix for an AI CLI.
+
+    Windows batch shims are parsed but never executed. This avoids cmd.exe
+    metacharacter injection and its 8191-character command-line limit.
     """
-    Resolve the correct command-line args to invoke a Node.js-based CLI tool.
+    override_name = f"{cli_name.upper()}_CLI_PATH"
+    override = os.environ.get(override_name)
+    if override:
+        override_path = os.path.abspath(os.path.expanduser(override))
+        if not os.path.exists(override_path):
+            raise FileNotFoundError(f"{override_name} does not exist: {override_path}")
+        suffix = Path(override_path).suffix.lower()
+        if suffix in WINDOWS_SHIM_SUFFIXES:
+            parsed = _parse_windows_npm_shim(override_path)
+            if parsed:
+                return parsed
+            raise RuntimeError(
+                f"Refusing unsafe Windows shim from {override_name}; point it "
+                "to a native executable or .js entry point"
+            )
+        return _node_command(override_path) if suffix == ".js" else [override_path]
 
-    On Windows:
-      0. Check CLAUDE_CLI_PATH environment variable (if cli_name is "claude")
-      1. Try to find the cli.js via known paths under npm global dir → [node, cli.js]
-      2. Try to parse the .cmd file to extract the js path → [node, cli.js]
-      3. Fallback to the full-path .cmd file (not cwd-relative)
-    On Linux/macOS:
-      - Simply use shutil.which()
-
-    Args:
-        cli_name:      The CLI command name (e.g. "claude", "codex", "gemini")
-        js_candidates: List of relative paths under npm_dir to try for cli.js
-                       (e.g. ["node_modules/@anthropic-ai/claude-code/cli.js"])
-    """
-    # ── 0. Manual Override ──
-    if cli_name == "claude":
-        env_path = os.environ.get("CLAUDE_CLI_PATH")
-        if env_path and os.path.exists(env_path):
-            if env_path.endswith(".js"):
-                node_path = shutil.which("node") or "node"
-                return [node_path, env_path]
-            return [env_path]
-
+    which_cmd = shutil.which(cli_name)
     if sys.platform != "win32":
-        cmd = shutil.which(cli_name) or cli_name
-        return [cmd]
+        return [which_cmd or cli_name]
+
+    # Native executables, including modern Claude Code, are safe to run directly.
+    if which_cmd and Path(which_cmd).suffix.lower() not in WINDOWS_SHIM_SUFFIXES:
+        return [which_cmd]
 
     npm_dir = find_npm_global_dir()
-    node_path = shutil.which("node") or "node"
-
-    # ── 1. Try known js_candidates ──
     if npm_dir:
-        for rel_path in js_candidates:
-            full_path = os.path.join(npm_dir, rel_path)
-            if os.path.exists(full_path):
-                print(f"[{cli_name} wrapper] Using node + cli.js: {full_path}", file=sys.stderr)
-                return [node_path, full_path]
+        for relative in js_candidates:
+            candidate = os.path.join(npm_dir, relative)
+            if os.path.isfile(candidate):
+                return _node_command(candidate)
 
-    # ── 2. Try parsing the .cmd file ──
-    # Look for .cmd in npm global dir OR in PATH
     cmd_locations = []
     if npm_dir:
         cmd_locations.append(os.path.join(npm_dir, f"{cli_name}.cmd"))
-    
-    # Also check where it actually is (shutil.which)
-    which_cmd = shutil.which(cli_name)
-    if which_cmd and which_cmd.lower().endswith((".cmd", ".bat")):
+    if which_cmd and Path(which_cmd).suffix.lower() in WINDOWS_SHIM_SUFFIXES:
         cmd_locations.append(which_cmd)
 
-    for cmd_file in cmd_locations:
-        if os.path.exists(cmd_file):
-            try:
-                with open(cmd_file, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        line = line.strip().strip('"')
-                        # Extract JS path from line like: node "%~dp0\node_modules\..." %*
-                        if ".js" in line and cli_name in line.lower():
-                            # Resolve %~dp0 to the cmd file's directory
-                            base_dir = os.path.dirname(cmd_file)
-                            js_path = line.replace("%~dp0", base_dir + os.sep)
-                            parts = js_path.split('"')
-                            for part in parts:
-                                part = part.strip()
-                                # Clean up potential extra flags or arguments
-                                if " " in part and not os.path.exists(part):
-                                    part = part.split(" ")[0]
-                                if part.endswith(".js") and os.path.exists(part):
-                                    print(f"[{cli_name} wrapper] Parsed from .cmd: {part}", file=sys.stderr)
-                                    return [node_path, part]
-            except Exception:
-                pass
+    for cmd_file in dict.fromkeys(cmd_locations):
+        if os.path.isfile(cmd_file):
+            parsed = _parse_windows_npm_shim(cmd_file)
+            if parsed:
+                return parsed
 
-    # ── 3. Fallback: full-path .cmd or .exe ──
-    for cmd_file in cmd_locations:
-        if os.path.exists(cmd_file):
-            # Special case for Claude: we MUST use JS version if possible to avoid popup windows or broken shims
-            if cli_name == "claude" and not cmd_file.endswith(".js"):
-                # If we're here, we found a .cmd/.exe but failed to parse a .js out of it.
-                # Let's try one last place: sibling node_modules
-                base_dir = os.path.dirname(cmd_file)
-                js_test = os.path.join(base_dir, "node_modules", "@anthropic-ai", "claude-code", "cli.js")
-                if os.path.exists(js_test):
-                    print(f"[{cli_name} wrapper] Found sibling JS: {js_test}", file=sys.stderr)
-                    return [node_path, js_test]
-                
-                # If still not found, and it's Claude, warn loudly but allow fallback IF it's a .js
-                # (Actually, we've already tried js_candidates)
-                print(f"[{cli_name} wrapper] WARNING: Failed to find JS version of Claude. "
-                      f"Using {cmd_file} may cause popup windows.", file=sys.stderr)
-
-            print(f"[{cli_name} wrapper] Fallback to full-path: {cmd_file}", file=sys.stderr)
-            return [cmd_file]
-
-    # Last resort: just the name (rely on PATH)
-    if not which_cmd:
-        which_cmd = cli_name
-    
-    if cli_name == "claude" and not which_cmd.endswith(".js"):
-         print(f"[{cli_name} wrapper] CRITICAL: Could not find JS path for Claude. "
-               "The relay will attempt to use the system command, but this may fail or pop up windows.", file=sys.stderr)
-
-    print(f"[{cli_name} wrapper] WARNING: using {which_cmd}", file=sys.stderr)
-    return [which_cmd]
+    raise FileNotFoundError(
+        f"Could not find a safe {cli_name} executable. Install it or set "
+        f"{override_name} to a native executable or JavaScript entry point."
+    )

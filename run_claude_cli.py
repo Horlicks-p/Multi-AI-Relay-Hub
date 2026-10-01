@@ -13,9 +13,6 @@ import json
 
 from cli_common import find_cli_args, get_project_cwd
 
-sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8', errors='ignore')
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='ignore', write_through=True)
-
 SYSTEM_PROMPT = (
     "Your identity is [claude]. You are participating in a multi-AI chat room. "
     "Messages you receive are prefixed with [speaker_name] tags "
@@ -39,51 +36,61 @@ CLI_JS_CANDIDATES = [
 ]
 
 try:
-    RELAY_TIMEOUT_SEC = int(os.environ.get("RELAY_TIMEOUT_SEC", 600))
+    RELAY_TIMEOUT_SEC = max(1, int(os.environ.get("RELAY_TIMEOUT_SEC", 600)))
 except (ValueError, TypeError):
     RELAY_TIMEOUT_SEC = 600
 
-RELAY_MODE = os.environ.get("RELAY_MODE", "readonly").lower().strip()
+RELAY_MODE = os.environ.get(
+    "RELAY_AGENT_MODE", os.environ.get("RELAY_MODE", "readonly")
+).lower().strip()
+
+
+def _configure_stdio() -> None:
+    if hasattr(sys.stdin, "buffer"):
+        sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
+    if hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(
+            sys.stdout.buffer, encoding="utf-8", errors="replace", write_through=True
+        )
 
 
 def call_claude(message: str) -> str:
-    try:
-        safe_message = message.replace("\n", " \\n ")
+    args = find_cli_args("claude", CLI_JS_CANDIDATES)
+    args.extend([
+        "-p",
+        "--append-system-prompt", SYSTEM_PROMPT,
+        "--output-format", "text",
+        "--no-session-persistence",
+        "--permission-prompts", "none",
+    ])
+    if RELAY_MODE == "full":
+        args.extend(["--permission-mode", "bypassPermissions"])
+    else:
+        args.extend(["--permission-mode", "plan"])
 
-        args = find_cli_args("claude", CLI_JS_CANDIDATES)
-        args.extend([
-            "-p", safe_message,
-            "--system-prompt", SYSTEM_PROMPT.replace("\n", " \\n "),
-            "--output-format", "text",
-            "--no-session-persistence",
-        ])
-        if RELAY_MODE == "full":
-            args.extend(["--permission-mode", "bypassPermissions"])  # ★ full 模式才自動批准
-
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            timeout=RELAY_TIMEOUT_SEC,
-            creationflags=0x08000000 if sys.platform == "win32" else 0,
-            cwd=get_project_cwd(),
-            stdin=subprocess.DEVNULL,
-        )
-        return result.stdout.strip()
-    except subprocess.TimeoutExpired:
-        print(f"[claude wrapper] Timeout after {RELAY_TIMEOUT_SEC}s", file=sys.stderr)
-        return ""
-    except FileNotFoundError:
-        print("[claude wrapper] claude CLI not found", file=sys.stderr)
-        return ""
-    except Exception as e:
-        print(f"[claude wrapper error] {e}", file=sys.stderr)
-        return ""
+    result = subprocess.run(
+        args,
+        input=message,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        # relay.py owns the earlier timeout so it can terminate the whole tree.
+        timeout=RELAY_TIMEOUT_SEC + 5,
+        creationflags=0x08000000 if sys.platform == "win32" else 0,
+        cwd=get_project_cwd(),
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no error output"
+        raise RuntimeError(f"Claude CLI exited with {result.returncode}: {detail[:1000]}")
+    if not result.stdout.strip():
+        raise RuntimeError("Claude CLI returned an empty response")
+    return result.stdout.strip()
 
 
 def main():
+    _configure_stdio()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -104,9 +111,14 @@ def main():
             if response:
                 print(response, flush=True)
                 print("END_OF_RESPONSE", flush=True)
+        except subprocess.TimeoutExpired:
+            print(f"[claude wrapper] Timeout after {RELAY_TIMEOUT_SEC}s", file=sys.stderr)
+            return 124
         except Exception as e:
             print(f"[claude wrapper error] {e}", file=sys.stderr)
+            return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
